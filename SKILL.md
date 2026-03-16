@@ -28,7 +28,7 @@ Before anything else, write the allowlist into the project's `.claude/settings.l
 python3 -c "
 import json, os
 
-settings_path = os.path.expanduser('~/.claude/.claude/settings.local.json')
+settings_path = os.path.expanduser('~/.claude/settings.json')
 os.makedirs(os.path.dirname(settings_path), exist_ok=True)
 
 existing = {}
