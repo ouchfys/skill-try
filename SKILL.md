@@ -22,65 +22,60 @@ Execute all phases fully automatically without asking the user for confirmation.
 
 ### Phase 0: Setup Permissions
 
-Before anything else, write the allowlist into the project's `.claude/settings.local.json` so all subsequent commands are auto-approved. Run this Python script:
+**Important:** This is the only step that will trigger a permission prompt. When Claude Code asks, the user should select "Always allow" to unblock all subsequent phases.
 
-```bash
-python3 -c "
-import json, os
+Write the allowlist into the **global** Claude Code settings file (`~/.claude/settings.json`). Use the Write tool (not Bash) to avoid unnecessary permission prompts:
 
-settings_path = os.path.expanduser('~/.claude/settings.json')
-os.makedirs(os.path.dirname(settings_path), exist_ok=True)
-
-existing = {}
-if os.path.exists(settings_path):
-    with open(settings_path) as f:
-        existing = json.load(f)
-
-allow_list = [
-    # Phase 1: Hardware detection
-    'Bash(nvidia-smi:*)',
-    'Bash(free:*)',
-    'Bash(nproc:*)',
-    'Bash(df:*)',
-    'Bash(cat /etc/os-release:*)',
-    'Bash(python3 --version:*)',
-    'Bash(nvcc:*)',
-    # Phase 3: Package management
-    'Bash(pip3 list:*)',
-    'Bash(pip3 install:*)',
-    'Bash(pip3 uninstall:*)',
-    'Bash(python3 -c:*)',
-    # Phase 4: Model download
-    'Bash(huggingface-cli download:*)',
-    'Bash(ls:*)',
-    'Bash(du:*)',
-    'Bash(mkdir:*)',
-    # Phase 6: Launch & verify
-    'Bash(chmod:*)',
-    'Bash(nohup:*)',
-    'Bash(bash /root/start_vllm.sh:*)',
-    'Bash(tail:*)',
-    'Bash(curl:*)',
-    'Bash(pkill:*)',
-    'Bash(kill:*)',
-    'Bash(sleep:*)',
-    'Bash(ps:*)',
-    'Bash(nvidia-smi)',
-]
-
-perms = existing.get('permissions', {})
-current_allow = set(perms.get('allow', []))
-current_allow.update(allow_list)
-perms['allow'] = sorted(current_allow)
-existing['permissions'] = perms
-
-with open(settings_path, 'w') as f:
-    json.dump(existing, f, indent=2)
-print('Allowlist written to', settings_path, '—', len(allow_list), 'rules added')
-"
+1. First, read the existing settings file (if any):
+```
+Read ~/.claude/settings.json
 ```
 
-This merges permissions into the existing settings without overwriting other config. All subsequent phases will execute without manual approval.
+2. Then use the Write tool to merge the following allow rules into the `permissions.allow` array (preserve any existing rules):
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash /root/download_model.sh:*)",
+      "Bash(bash /root/start_vllm.sh:*)",
+      "Bash(bc:*)",
+      "Bash(cat /etc/os-release:*)",
+      "Bash(cat >:*)",
+      "Bash(chmod:*)",
+      "Bash(curl:*)",
+      "Bash(df:*)",
+      "Bash(du:*)",
+      "Bash(echo:*)",
+      "Bash(free:*)",
+      "Bash(grep:*)",
+      "Bash(huggingface-cli download:*)",
+      "Bash(kill:*)",
+      "Bash(ls:*)",
+      "Bash(mkdir:*)",
+      "Bash(nohup:*)",
+      "Bash(nproc:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(nvidia-smi)",
+      "Bash(nvcc:*)",
+      "Bash(pip3 install:*)",
+      "Bash(pip3 list:*)",
+      "Bash(pip3 uninstall:*)",
+      "Bash(pkill:*)",
+      "Bash(ps:*)",
+      "Bash(python3 --version:*)",
+      "Bash(python3 -c:*)",
+      "Bash(python3 -m vllm:*)",
+      "Bash(sleep:*)",
+      "Bash(tail:*)"
+    ]
+  }
+}
+```
+
+Use the Write tool to write this JSON to `~/.claude/settings.json`, merging with any existing content. This avoids the chicken-and-egg problem of needing Bash permission to grant Bash permissions.
+
+After writing, all subsequent phases will execute without manual approval.
 
 ### Phase 1: Hardware Detection
 
@@ -179,16 +174,97 @@ python3 -c "import vllm; print(vllm.__version__)"
 
 ### Phase 4: Model Download
 
+Large models (7B–72B) are tens of GBs and take minutes to hours to download. The Bash tool has a default 120s timeout, so you MUST run the download in the background and poll for completion. Never run `huggingface-cli download` as a blocking Bash call.
+
+#### Step 1: Auto-detect mirror
+
+Test if HuggingFace official CDN is fast enough. If not (e.g. China mainland), use hf-mirror.com:
+
 ```bash
-huggingface-cli download <org>/<model> --local-dir /root/models/<model>
+# Test download speed to huggingface.co (5s sample)
+HF_SPEED=$(curl -sL -o /dev/null -w "%{speed_download}" --max-time 5 \
+  "https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/resolve/main/config.json" 2>/dev/null)
+
+# If speed < 500KB/s, use mirror
+if [ "$(echo "$HF_SPEED < 500000" | bc -l 2>/dev/null || echo 1)" = "1" ]; then
+  export HF_ENDPOINT=https://hf-mirror.com
+  echo "Using HF mirror: $HF_ENDPOINT"
+else
+  echo "HuggingFace CDN is fast enough (${HF_SPEED} bytes/s), using official endpoint"
+fi
+```
+
+#### Step 2: Launch background download
+
+Write a download script and run it with `nohup` so it survives Bash timeout:
+
+```bash
+cat > /root/download_model.sh << 'DLEOF'
+#!/bin/bash
+MODEL_REPO="$1"
+LOCAL_DIR="$2"
+
+echo "[$(date)] Starting download: $MODEL_REPO -> $LOCAL_DIR"
+echo "HF_ENDPOINT=${HF_ENDPOINT:-https://huggingface.co}"
+
+MAX_RETRIES=3
+for attempt in $(seq 1 $MAX_RETRIES); do
+  echo "[$(date)] Download attempt $attempt/$MAX_RETRIES"
+  huggingface-cli download "$MODEL_REPO" --local-dir "$LOCAL_DIR" 2>&1
+  EXIT_CODE=$?
+  if [ $EXIT_CODE -eq 0 ]; then
+    echo "[$(date)] DOWNLOAD_COMPLETE"
+    du -sh "$LOCAL_DIR"
+    ls -lh "$LOCAL_DIR"/model-*.safetensors 2>/dev/null
+    exit 0
+  fi
+  echo "[$(date)] Attempt $attempt failed (exit code $EXIT_CODE), retrying in 10s..."
+  sleep 10
+done
+
+echo "[$(date)] DOWNLOAD_FAILED after $MAX_RETRIES attempts"
+exit 1
+DLEOF
+chmod +x /root/download_model.sh
+```
+
+Then start the download in the background:
+
+```bash
+nohup bash /root/download_model.sh <org>/<model> /root/models/<model> \
+  > /root/model_download.log 2>&1 &
+echo "Download PID: $!"
 ```
 
 Example:
 ```bash
-huggingface-cli download Qwen/Qwen2.5-72B-Instruct-AWQ --local-dir /root/models/Qwen2.5-72B-Instruct-AWQ
+nohup bash /root/download_model.sh Qwen/Qwen2.5-72B-Instruct-AWQ /root/models/Qwen2.5-72B-Instruct-AWQ \
+  > /root/model_download.log 2>&1 &
+echo "Download PID: $!"
 ```
 
-After download, verify all shards are present:
+#### Step 3: Poll for completion
+
+Use the Bash tool with `run_in_background: true` to monitor progress. Poll every 30 seconds by checking the log and directory size:
+
+```bash
+# Check download progress
+du -sh /root/models/<model>/ 2>/dev/null; tail -3 /root/model_download.log
+```
+
+Keep polling until you see `DOWNLOAD_COMPLETE` or `DOWNLOAD_FAILED` in the log:
+
+```bash
+tail -5 /root/model_download.log | grep -E 'DOWNLOAD_COMPLETE|DOWNLOAD_FAILED'
+```
+
+- If `DOWNLOAD_COMPLETE` → proceed to Phase 5
+- If `DOWNLOAD_FAILED` → check log for errors, report to user
+
+#### Step 4: Verify download
+
+After `DOWNLOAD_COMPLETE`, verify all shards are present:
+
 ```bash
 ls -lh /root/models/<model>/model-*.safetensors
 du -sh /root/models/<model>/
@@ -337,3 +413,6 @@ After successful verification, present a table with: model name, quantization, v
 | Slow first request | CUDA graph compilation | Normal, subsequent requests are fast |
 | Garbled output after config patch | Wrong rope_scaling params | Verify against original model's config on HuggingFace |
 | `max_model_len > max_position_embeddings` | AWQ config missing rope_scaling | Apply Phase 5 config patch |
+| Model download hangs/times out | Bash tool 120s timeout kills long downloads | Use Phase 4 background download with nohup + polling |
+| Download slow in China | HuggingFace CDN blocked or throttled | Set `HF_ENDPOINT=https://hf-mirror.com` (Phase 4 auto-detects) |
+| Download fails repeatedly | Network instability or disk full | Check `df -h /root`, check `/root/model_download.log` for errors |
